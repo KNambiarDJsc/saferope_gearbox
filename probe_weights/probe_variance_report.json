@@ -1,0 +1,98 @@
+{
+  "model_name": "google/gemma-2-2b-it",
+  "n_seeds": 5,
+  "train_ratio": 0.8,
+  "n_samples_total": 30,
+  "n_harmful": 15,
+  "n_safe": 15,
+  "layers": {
+    "6": {
+      "train_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "test_acc": {
+        "mean": 0.9333,
+        "std": 0.0816
+      },
+      "overfit_gap": 0.0667,
+      "dsi": {
+        "mean": 0.5299,
+        "std": 0.0373
+      },
+      "warnings": {
+        "overfitting": false,
+        "direction_instability": true
+      },
+      "recommendation": "CAUTION"
+    },
+    "12": {
+      "train_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "test_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "overfit_gap": 0.0,
+      "dsi": {
+        "mean": 0.2609,
+        "std": 0.0145
+      },
+      "warnings": {
+        "overfitting": false,
+        "direction_instability": true
+      },
+      "recommendation": "CAUTION"
+    },
+    "18": {
+      "train_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "test_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "overfit_gap": 0.0,
+      "dsi": {
+        "mean": 0.1863,
+        "std": 0.0206
+      },
+      "warnings": {
+        "overfitting": false,
+        "direction_instability": true
+      },
+      "recommendation": "CAUTION"
+    },
+    "24": {
+      "train_acc": {
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "test_acc": {
+        "mean": 0.9667,
+        "std": 0.0667
+      },
+      "overfit_gap": 0.0333,
+      "dsi": {
+        "mean": 0.1658,
+        "std": 0.0271
+      },
+      "warnings": {
+        "overfitting": false,
+        "direction_instability": true
+      },
+      "recommendation": "CAUTION"
+    }
+  },
+  "recommended_layers": [],
+  "caution_layers": [
+    6,
+    12,
+    18,
+    24
+  ],
+  "skip_layers": []
+}
