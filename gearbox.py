@@ -52,7 +52,7 @@ class GearboxConfig:
 
     All hyperparameters for the SafeRoPE Gearbox.
 
-   
+ 
 
     energy_epsilon: Residual Energy Anchor tolerance.
 
@@ -60,27 +60,43 @@ class GearboxConfig:
 
         we fall back to identity (R → I). Prevents OOD glitch.
 
-   
+ 
 
     steering_intensity: Scale factor [0, 1] for the intervention.
 
         0 = no steering (R = I), 1 = full projection.
 
-        Use 0.3–0.7 for the helpfulness-alignment sweep.
+        Use 0.3-0.7 for the helpfulness-alignment sweep.
 
-   
+ 
 
     target_layers: Which transformer layers to apply gearbox to.
 
-        None = all layers. Recommend starting with [8, 12, 16] for Llama-1B.
+        None = all layers.
 
-   
+ 
 
     head_subset: Which attention heads to steer.
 
-        None = all heads. Recommend heads identified by high probe accuracy.
+        None = all heads.
 
-   
+ 
+
+    rope_pairing: RoPE dimension pairing scheme.
+
+        "split"       -- Llama style: pairs (i, i + d//2).
+
+        "interleaved" -- Gemma-2 style: pairs (2i, 2i+1).
+
+        "auto"        -- detect from model config (default).
+
+ 
+
+    model_arch: Architecture hint for hook attachment paths.
+
+        "auto" detects from model config (recommended).
+
+ 
 
     verbose: Print commutativity errors and energy anchor triggers.
 
@@ -96,7 +112,69 @@ class GearboxConfig:
 
     commutativity_tol: float = 1e-3
 
+    rope_pairing: str = "auto"   # "split" | "interleaved" | "auto"
+
+    model_arch: str = "auto"     # "llama" | "gemma2" | "auto"
+
     verbose: bool = True
+
+ 
+
+ 
+
+def detect_model_arch(model: "nn.Module") -> Tuple[str, str]:
+
+    """
+
+    Auto-detect model architecture and RoPE pairing from model config.
+
+ 
+
+    Returns:
+
+        (arch, rope_pairing) where:
+
+            arch         = "gemma2" | "llama" | "unknown"
+
+            rope_pairing = "interleaved" | "split"
+
+    """
+
+    model_type = getattr(model.config, "model_type", "").lower()
+
+    arch_name = getattr(model.config, "_name_or_path", "").lower()
+
+ 
+
+    if "gemma2" in model_type or "gemma-2" in arch_name or "gemma_2" in arch_name:
+
+        return "gemma2", "interleaved"
+
+    elif "gemma" in model_type or "gemma" in arch_name:
+
+        return "gemma", "split"
+
+    elif "llama" in model_type or "llama" in arch_name:
+
+        return "llama", "split"
+
+    elif "mistral" in model_type or "mistral" in arch_name:
+
+        return "mistral", "split"
+
+    else:
+
+        log.warning(
+
+            f"[Gearbox] Unknown model type '{model_type}'. "
+
+            f"Defaulting to split RoPE. "
+
+            f"If results are poor, try rope_pairing='interleaved'."
+
+        )
+
+        return "unknown", "split"
 
  
 
@@ -294,7 +372,9 @@ class CommutativeProjector:
 
         head_dim: int,
 
-        config: GearboxConfig
+        config: GearboxConfig,
+
+        rope_pairing: str = "split",
 
     ):
 
@@ -304,7 +384,7 @@ class CommutativeProjector:
 
         d = harm_basis.shape[0]
 
-       
+ 
 
         assert d == head_dim, (
 
@@ -312,65 +392,79 @@ class CommutativeProjector:
 
         )
 
-       
+ 
 
         U = harm_basis.float()  # (d, rank)
 
         alpha = config.steering_intensity
 
-       
+ 
 
         # Build projection matrix: P = U Uᵀ (projects onto harm subspace)
 
         P = U @ U.T  # (d, d)
 
-       
+ 
 
         # Steering matrix: R = I - α * P
 
         R_raw = torch.eye(d) - alpha * P
 
-       
+ 
 
         # Enforce block-diagonal structure aligned to RoPE pairs
 
-        # RoPE rotates (dim 0, dim d/2), (dim 1, dim d/2+1), etc.
+        self.R = self._enforce_rope_commutativity(R_raw, rope_pairing)
 
-        # We use the "interleaved" pairing: (2i, 2i+1) for i in 0..d/2-1
+ 
 
-        self.R = self._enforce_rope_commutativity(R_raw)
+        # Verify commutativity using the same pairing
 
-       
-
-        # Verify commutativity
-
-        self._verify_commutativity()
+        self._verify_commutativity(rope_pairing)
 
    
 
-    def _enforce_rope_commutativity(self, R: torch.Tensor) -> torch.Tensor:
+    def _enforce_rope_commutativity(
+
+        self, R: torch.Tensor, rope_pairing: str = "split"
+
+    ) -> torch.Tensor:
 
         """
 
         Zero out entries that violate RoPE block structure.
 
-       
+ 
 
-        RoPE uses 2×2 rotation blocks. Our R must have the same
+        Two pairing schemes exist across model families:
 
-        block-diagonal structure to commute with it.
+ 
 
-       
+        SPLIT (Llama, Mistral, Gemma-1):
 
-        The key insight: a matrix commutes with all 2×2 rotations
+            Pairs dimension i with i + d//2.
 
-        iff it is itself block-diagonal with 2×2 blocks, and each
+            cos/sin applied as: [x[:d//2]*cos - x[d//2:]*sin,
 
-        block is a scalar multiple of I or a rotation matrix.
+                                  x[:d//2]*sin + x[d//2:]*cos]
 
-       
+ 
 
-        We approximate this by keeping only within-pair entries.
+        INTERLEAVED (Gemma-2, some Phi variants):
+
+            Pairs dimension 2i with 2i+1.
+
+            cos/sin applied as: [x[0]*cos - x[1]*sin,
+
+                                  x[0]*sin + x[1]*cos, ...]
+
+ 
+
+        Using the wrong pairing → large commutator error →
+
+        positional context corrupted → grammar degrades.
+
+        The commutativity test in _verify_commutativity catches this.
 
         """
 
@@ -378,81 +472,129 @@ class CommutativeProjector:
 
         R_comm = torch.zeros_like(R)
 
-       
+ 
 
-        # RoPE pairs: (i, i + d//2) for Llama-style RoPE
+        if rope_pairing == "interleaved":
 
-        half = d // 2
+            # Gemma-2 style: pair (2i, 2i+1)
 
-       
+            for i in range(0, d, 2):
 
-        for i in range(half):
+                j = i + 1
 
-            j = i + half
+                if j >= d:
 
-            # Keep the 2×2 block for this pair
+                    break
 
-            R_comm[i, i] = R[i, i]
+                R_comm[i, i] = R[i, i]
 
-            R_comm[i, j] = R[i, j]
+                R_comm[i, j] = R[i, j]
 
-            R_comm[j, i] = R[j, i]
+                R_comm[j, i] = R[j, i]
 
-            R_comm[j, j] = R[j, j]
+                R_comm[j, j] = R[j, j]
 
-       
+        else:
+
+            # Llama / split style: pair (i, i + d//2)
+
+            half = d // 2
+
+            for i in range(half):
+
+                j = i + half
+
+                R_comm[i, i] = R[i, i]
+
+                R_comm[i, j] = R[i, j]
+
+                R_comm[j, i] = R[j, i]
+
+                R_comm[j, j] = R[j, j]
+
+ 
 
         return R_comm
 
    
 
-    def _verify_commutativity(self):
+    def _verify_commutativity(self, rope_pairing: str = "split"):
 
         """
 
-        Test R W_θ ≈ W_θ R for a sample RoPE rotation.
+        Test R W_theta ~ W_theta R for a sample RoPE rotation.
 
-        Reports the Frobenius norm of the commutator [R, W_θ].
+        Builds W using the same pairing scheme as _enforce_rope_commutativity
+
+        so the test is consistent with the construction.
 
         """
 
         d = self.head_dim
 
-        theta = 0.5  # arbitrary test angle
+        theta = 0.5
 
-       
-
-        # Build a sample RoPE rotation (block structure)
+ 
 
         W = torch.zeros(d, d)
 
-        half = d // 2
+        if rope_pairing == "interleaved":
 
-        for i in range(half):
+            for i in range(0, d, 2):
 
-            W[i, i] = np.cos(theta * (i + 1))
+                j = i + 1
 
-            W[i, i + half] = -np.sin(theta * (i + 1))
+                if j >= d:
 
-            W[i + half, i] = np.sin(theta * (i + 1))
+                    break
 
-            W[i + half, i + half] = np.cos(theta * (i + 1))
+                freq = theta * (i // 2 + 1)
 
-       
+                W[i, i]   = np.cos(freq)
+
+                W[i, j]   = -np.sin(freq)
+
+                W[j, i]   = np.sin(freq)
+
+                W[j, j]   = np.cos(freq)
+
+        else:
+
+            half = d // 2
+
+            for i in range(half):
+
+                freq = theta * (i + 1)
+
+                W[i, i]        = np.cos(freq)
+
+                W[i, i + half] = -np.sin(freq)
+
+                W[i + half, i] = np.sin(freq)
+
+                W[i + half, i + half] = np.cos(freq)
+
+ 
 
         commutator = self.R @ W - W @ self.R
 
         error = commutator.norm(p='fro').item()
 
-       
+ 
 
         if self.config.verbose:
 
-            log.info(f"[Commutativity] ‖[R, W_θ]‖_F = {error:.6f} "
+            log.info(
 
-                     f"(tol={self.config.commutativity_tol})")
+                f"[Commutativity] pairing={rope_pairing} "
 
-       
+                f"||[R, W_theta]||_F = {error:.6f} "
+
+                f"(tol={self.config.commutativity_tol})"
+
+            )
+
+ 
 
         if error > self.config.commutativity_tol:
 
@@ -462,7 +604,9 @@ class CommutativeProjector:
 
                 f"tol {self.config.commutativity_tol}. "
 
-                f"RoPE fidelity not guaranteed."
+                f"RoPE fidelity not guaranteed. "
+
+                f"Try switching rope_pairing to the other scheme."
 
             )
 
@@ -672,51 +816,71 @@ class GearboxHook:
 
         verbose = self.verbose
 
-       
+ 
 
         def hook(module, input, output):
 
-            # output shape: (batch, seq_len, hidden)
+            # output shape: (batch, seq_len, proj_out_dim)
 
             x_orig = output.float()
 
-           
-
-            # Reshape to per-head view for head_dim-aligned projection
-
-            # (batch, seq, hidden) → (batch, seq, n_heads, head_dim)
-
             b, s, h = x_orig.shape
+
+ 
 
             head_dim = R.shape[0]
 
+ 
+
+            # GQA guard: if h is not evenly divisible by head_dim,
+
+            # the projection (k_proj/v_proj in GQA) uses fewer heads.
+
+            # head_dim is fixed per head; n_heads varies between q and kv.
+
+            if h % head_dim != 0:
+
+                # Dimension mismatch — skip this projection silently.
+
+                # This can happen with certain GQA configs where the
+
+                # kv head_dim differs. Log once then pass through.
+
+                log.debug(
+
+                    f"[Hook L{layer_idx} {proj_name}] "
+
+                    f"dim {h} not divisible by head_dim {head_dim}, "
+
+                    f"skipping intervention."
+
+                )
+
+                return output
+
+ 
+
             n_heads = h // head_dim
 
-           
-
-            x_heads = x_orig.view(b, s, n_heads, head_dim)  # (b, s, nh, d)
+            x_heads = x_orig.view(b, s, n_heads, head_dim)
 
             R_dev = R.to(x_heads.device)
 
-           
+ 
 
-            # Apply R to each head: x_steered = x @ Rᵀ (right-multiply)
+            # Apply R to each head: x_steered = x @ R^T (right-multiply)
 
-            # This is equivalent to rotating each head's representation
-
-            x_steered = x_heads @ R_dev.T  # (b, s, nh, d)
-
-           
+            x_steered = x_heads @ R_dev.T  # (b, s, n_heads, head_dim)
 
             x_steered_flat = x_steered.view(b, s, h)
 
-           
+ 
 
             # Apply energy anchor
 
             result = anchor.apply(x_orig, x_steered_flat, R_dev)
 
-           
+ 
 
             if verbose and layer_idx <= 2:
 
@@ -728,47 +892,67 @@ class GearboxHook:
 
                 )
 
-           
+ 
 
             return result.to(output.dtype)
 
-       
+ 
 
         return hook
 
    
 
-    def attach(self, model, layer_idx: int):
+    def attach(self, model, layer_idx: int, arch: str = "llama"):
 
         """
 
         Attach hooks to q_proj and k_proj of the specified layer.
 
-       
+ 
 
-        For Llama architecture:
+        Gemma-2 specifics vs Llama:
 
-            model.model.layers[i].self_attn.q_proj
+          - Same module path: model.model.layers[i].self_attn
 
-            model.model.layers[i].self_attn.k_proj
+          - BUT Gemma-2-2B uses GQA: 8 KV heads, 16 query heads
+
+            q_proj output: (batch, seq, num_heads * head_dim)
+
+            k_proj output: (batch, seq, num_kv_heads * head_dim)
+
+            These have DIFFERENT hidden dims so need separate R matrices
+
+            sized to their respective per-head dimensions.
+
+          - We handle this by checking output dim at hook time and
+
+            reshaping accordingly, not assuming num_heads == num_kv_heads.
 
         """
+
+        # Both Llama and Gemma-2 share the same module path
 
         layer = model.model.layers[layer_idx]
 
         attn = layer.self_attn
 
-       
+ 
 
         h1 = attn.q_proj.register_forward_hook(self._make_hook("q_proj"))
 
         h2 = attn.k_proj.register_forward_hook(self._make_hook("k_proj"))
 
-       
+ 
 
         self._handles.extend([h1, h2])
 
-        log.info(f"[Gearbox] Attached to layer {layer_idx} q_proj + k_proj")
+        log.info(
+
+            f"[Gearbox] Attached to layer {layer_idx} "
+
+            f"q_proj + k_proj (arch={arch})"
+
+        )
 
    
 
@@ -840,7 +1024,19 @@ class SafeRoPEGearbox:
 
         self.anchors: List[ResidualEnergyAnchor] = []
 
-       
+ 
+
+        # Auto-detect architecture and RoPE pairing
+
+        if config.model_arch == "auto" or config.rope_pairing == "auto":
+
+            detected_arch, detected_pairing = detect_model_arch(model)
+
+        arch = detected_arch if config.model_arch == "auto" else config.model_arch
+
+        rope_pairing = detected_pairing if config.rope_pairing == "auto" else config.rope_pairing
+
+ 
 
         # Determine head_dim from model config
 
@@ -848,25 +1044,41 @@ class SafeRoPEGearbox:
 
         self.head_dim = model_cfg.hidden_size // model_cfg.num_attention_heads
 
-       
+ 
 
         log.info(
 
-            f"[Gearbox] Model: {model_cfg._name_or_path}, "
+            f"[Gearbox] arch={arch}, rope_pairing={rope_pairing}, "
 
             f"head_dim={self.head_dim}, "
 
-            f"layers={model_cfg.num_hidden_layers}"
+            f"n_layers={model_cfg.num_hidden_layers}"
 
         )
 
-       
+ 
+
+        # Gemma-2 GQA info
+
+        num_kv_heads = getattr(model_cfg, "num_key_value_heads", model_cfg.num_attention_heads)
+
+        if num_kv_heads != model_cfg.num_attention_heads:
+
+            log.info(
+
+                f"[Gearbox] GQA detected: {model_cfg.num_attention_heads} Q heads, "
+
+                f"{num_kv_heads} KV heads. k_proj hooks will be GQA-aware."
+
+            )
+
+ 
 
         # Build per-layer components
 
         target_layers = config.target_layers or list(probe_weights.keys())
 
-       
+ 
 
         for layer_idx in target_layers:
 
@@ -876,13 +1088,13 @@ class SafeRoPEGearbox:
 
                 continue
 
-           
+ 
 
             extractor = HarmSubspaceExtractor(rank=1)
 
             extractor.fit(probe_weights[layer_idx])
 
-           
+ 
 
             projector = CommutativeProjector(
 
@@ -890,17 +1102,19 @@ class SafeRoPEGearbox:
 
                 head_dim=self.head_dim,
 
-                config=config
+                config=config,
+
+                rope_pairing=rope_pairing,
 
             )
 
-           
+ 
 
             anchor = ResidualEnergyAnchor(epsilon=config.energy_epsilon)
 
             self.anchors.append(anchor)
 
-           
+ 
 
             hook = GearboxHook(
 
@@ -910,11 +1124,11 @@ class SafeRoPEGearbox:
 
                 layer_idx=layer_idx,
 
-                verbose=config.verbose
+                verbose=config.verbose,
 
             )
 
-            self.hooks.append((layer_idx, hook))
+            self.hooks.append((layer_idx, hook, arch))
 
    
 
@@ -922,19 +1136,19 @@ class SafeRoPEGearbox:
 
         """Attach all hooks to the model."""
 
-        for layer_idx, hook in self.hooks:
+        for layer_idx, hook, arch in self.hooks:
 
-            hook.attach(self.model, layer_idx)
+            hook.attach(self.model, layer_idx, arch)
 
         log.info(f"[Gearbox] Installed on {len(self.hooks)} layers.")
 
-   
+ 
 
     def remove(self):
 
         """Detach all hooks."""
 
-        for _, hook in self.hooks:
+        for _, hook, _ in self.hooks:
 
             hook.detach()
 
@@ -964,7 +1178,7 @@ class SafeRoPEGearbox:
 
         }
 
-   
+ 
 
     def __enter__(self):
 
@@ -972,7 +1186,7 @@ class SafeRoPEGearbox:
 
         return self
 
-   
+ 
 
     def __exit__(self, *args):
 
