@@ -434,7 +434,11 @@ class StatisticalEvaluator:
 
         try:
 
-            inputs = self.tokenizer.apply_chat_template(
+            # apply_chat_template may return a BatchEncoding or a tensor
+
+            # depending on transformers version. Always extract input_ids.
+
+            result = self.tokenizer.apply_chat_template(
 
                 [{"role": "user", "content": prompt}],
 
@@ -442,7 +446,15 @@ class StatisticalEvaluator:
 
                 add_generation_prompt=True
 
-            ).to(self.device)
+            )
+
+            if hasattr(result, "input_ids"):
+
+                inputs = result.input_ids.to(self.device)
+
+            else:
+
+                inputs = result.to(self.device)
 
         except Exception:
 
@@ -452,7 +464,11 @@ class StatisticalEvaluator:
 
             ).input_ids.to(self.device)
 
-       
+ 
+
+        input_len = inputs.shape[-1]
+
+ 
 
         t0 = time.perf_counter()
 
@@ -472,9 +488,9 @@ class StatisticalEvaluator:
 
         latency_ms = (time.perf_counter() - t0) * 1000
 
-       
+ 
 
-        new_tokens = output[0][inputs.shape[-1]:]
+        new_tokens = output[0][input_len:]
 
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
@@ -1527,3 +1543,4 @@ if __name__ == "__main__":
     elif args.exp == "commutativity":
 
         evaluator.run_commutativity_test()
+
